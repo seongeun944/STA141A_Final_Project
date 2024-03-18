@@ -1,0 +1,709 @@
+---
+title: "Neural Correlates of Decision Making: Analyzing Visual Cortex Activity in Mice during Stimulus Discrimination Trials"
+author: "By Seongeun Jeon"
+date: "March 18, 2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, eval=TRUE, message=FALSE}
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(xgboost)
+library(caret) 
+library(pROC)
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+    print(session[[i]]$mouse_name)
+    print(session[[i]]$date_exp)
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+get_trial_data <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trial_tibble  = trial_tibble%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trial_id])
+  trial_tibble
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+get_session_data <- function(session_id){
+  n_trial <- length(session[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_data(session_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  session_tibble <- do.call(rbind, trial_list)
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+binename <- paste0("bin", as.character(1:40))
+
+get_trial_functional_data <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trial_bin_average) <- binename
+  trial_tibble  = as_tibble(trial_bin_average)%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trial_id])
+  
+  trial_tibble
+}
+get_session_functional_data <- function(session_id){
+  n_trial <- length(session[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_functional_data(session_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trial_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- abs(full_functional_tibble$contrast_left-full_functional_tibble$contrast_right)
+
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+full_tibble <- do.call(rbind, session_list)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+full_tibble$contrast_diff <- abs(full_tibble$contrast_left-full_tibble$contrast_right)
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+show_contrast <- full_functional_tibble %>% group_by(contrast_diff) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+session_success_rate <- full_functional_tibble %>% group_by(session_id) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+
+```
+<br/> <!-- Line break HTML tag -->
+*This report obeys the following contents: 
+ 
+#####  0/   Abstract
+  
+#####  1/   Introduction
+
+#####  2/   Exploratory analysis
+  
+#####  3/   Data integration
+  
+#####  4/   Predictive modeling 
+  
+#####  5/   Prediction performance on the test sets
+  
+#####  6/   Conclusion
+
+#####  7/   Reference 
+
+<br/> <!-- Line break HTML tag -->
+
+### | 0. Abstract |
+
+  As a student who is keen to specialize in the field of data science, I have been given a task to analyze the data of *Steinmetz et al. (2019)*, which is related to visual cortex activity in mice over trials. It is a great opportunity for me to gain deep knowlege of the relationship between neural activity and decision-making processes. By doing so, I can contribute to a better understanding of the underlying mechanisms that drive behavior in experimental conditions. In this report, I aim to provide essential information about the dataset and various models that will be used to highlight its accuracy in the conclusion. My main objective is to develop a predictive model that can predict the outcome of each trial using the neural activity data and stimuli. To achieve this, I will analyze a subset of data collected by 
+*Steinmetz et al. (2019)*.
+  
+<br/> <!-- Line break HTML tag -->
+
+### | 1. Introduction | 
+
+  The study investigates the connection between decision-making and neural activity by analyzing the behavior of neurons in the visual cortex of mice during stimulus discrimination trials. According to the data provided by *Steinmetz et al. (2019)*, 18 sessions were conducted on four mice: Cori, Frossman, Hence, and Lederberg. The analysis also examines the response patterns of neurons from stimulus pre-onset to 0.4 seconds post-onset. During the sessions, the four mice were presented with various levels of visual stimuli that required them to make decisions using a forepaw-controlled wheel. Successful task performance resulted in rewards, while failure led to penalties. The primary objective of the analysis is to understand how neuronal firing patterns correlate with different task parameters, such as stimulus contrast and decision outcomes, to make a high success rating model in the later section of the report. 
+  
+<br/> <!-- Line break HTML tag -->  
+
+### | 2. Exploratory analysis |  
+
+  Comprehending significant elements of the data is vital to making an ideal conclusion. This section includes essential statements of data structures aiming to explore interesting patterns of the data among trials, identify which patterns make a trial more likely to have a successful response, and predict the results of random trials of all 18 sessions. 
+  
+<br/> <!-- Line break HTML tag -->
+
+##### 2-1. Data Structure Across Sessions 
+
+  I first acknowledged the data structure across sessions. It was essential to comprehend the variables in each session to guarantee the precision and reliability of the analysis. Furthermore, I could better interpret and compare their results across sessions and trials by understanding the factors. The following table shows 8 variables across sessions with description: 
+  
+<br/> <!-- Line break HTML tag -->
+
+```{r, echo=FALSE, fig.align='center'}
+
+numbers <- c("1","2","3","4","5","6","7","8")
+variables <- c("contrast_left", "contrast_right", "feedback_type", "mouse_name", "brain_area", "date_exp", "spks", "time")
+descriptions <- c("Contrast of the left stimulus", "Contrast of the right stimulus", "Type of the feedback, 1 for success and -1 for failure", "Name of the mouse (Cori, Frossman, Hence, and Lederberg", "Area of the brain where each neuron lives", "Date of experiment", "Numbers of spikes of neurons in the visual cortex in time bins defined in `time`", "Centers of the time bins for `spks`")
+
+
+variable_table <- data.frame(Numbers=numbers, Variables = variables, Description = descriptions)
+
+variable_table %>%
+  kable("html") %>%
+  kable_styling(full_width = FALSE, 
+                bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(1:2, border_left = FALSE, border_right = FALSE) %>%
+  column_spec(2, width = "10em")
+
+```
+
+<br/> <!-- Line break HTML tag -->
+
+##### 2-2. Neural Activities (Spike Rate) over each Sessions 
+
+Acknowledging spike rates allowed me to identify patterns of neural activity with different experimental conditions and stimuli. I could compare neural responses between different experimental sessions and conditions by examining spike rates (average spike rate over sessions, specifically) across sessions. The following chart illustrates the average spike rate over sessions from 1 to 18 : 
+  
+<br/> <!-- Line break HTML tag -->
+
+```{r, echo=FALSE, fig.align='center', message=FALSE}
+
+average_spike <- full_tibble %>%
+  group_by(session_id, trial_id) %>%
+  summarise(mean_spikes = sum(region_sum_spike) / sum(region_count)) %>%
+  group_by(session_id) %>%
+  summarise(mean_session_spikes = mean(mean_spikes))
+
+
+ggplot(average_spike, aes(x = factor(session_id), y = mean_session_spikes)) +
+  geom_point(shape = 21, color = "powderblue", fill = "black", size = 3) + 
+  labs(x = "Session", y = "Average Spike Rate") +
+  ggtitle("Average Spike Rate per Session") +
+  theme(panel.background = element_rect(fill = "transparent"), 
+        axis.text.x = element_text(angle = 0, hjust = 1, vjust = 1), 
+        axis.text.y = element_text(angle = 0), 
+        panel.grid.major = element_line(color = "grey83"),  
+        plot.title = element_text(hjust = 0.5))  
+
+```
+
+The chart illustrates that the average for each session are not consistent. As the session progresses, there are no significant development of the spike rate. For most of the sessions, it shows and average spike rate in between 1.0 and 2.0. 
+
+<br/> <!-- Line break HTML tag -->
+
+##### 2-3. Changes Across Trials 
+
+Here, I made charts to visualize the overall neuron spike rate change over time. By visualizing the spike rate change over time, I was able to compare experimental conditions over sessions and identify the similarities and differences in neural response under different conditions. The following provides the average spike rate over the number of trials of all 18 sessions.  
+  
+```{r,echo=FALSE, message=FALSE}
+
+col_names <-names(full_functional_tibble)
+region_sum_subset <- col_names[grep("^region_sum", col_names)]
+region_mean_subset <- col_names[grep("^region_mean", col_names)]
+
+```
+
+```{r,echo=FALSE, message=FALSE}
+
+average_spike <- full_tibble %>% group_by( session_id,trial_id) %>% summarise(mean_spike = sum(region_sum_spike)/sum(region_count))
+
+average_spike$mouse_name <- full_functional_tibble$mouse_name
+average_spike$contrast_diff <- full_functional_tibble$contrast_diff
+average_spike$success <- full_functional_tibble$success
+
+```
+
+<br/> <!-- Line break HTML tag -->
+
+##### The change of overall neuron spike rate for each session 
+
+In the change of overall neuron spike rate for each session, we can see that the majority of average spike rate across sessions show a negative trend. Which means that as number of trials increase, the avarage spike rate seems to decrease. You can see the blue line (the regression line) decrease as trials proceed. Additionally, according to the blue regression line, the average vary a lot throughout the sessions. 
+
+```{r, echo=FALSE, fig.align='center', message=FALSE}
+
+ggplot(average_spike, aes(x = trial_id, y = mean_spike)) + 
+  geom_line(color = "black") + 
+  geom_smooth(method = "loess", color = "powderblue") + 
+  facet_wrap(~session_id, scales = "fixed", ncol = 6) +  
+  labs(x = "Number of Trials", y = "Average Spike Rate", title = "Change in Overall Neuron Spike Rate Across Sessions") +  
+  theme(panel.background = element_rect(fill = "grey97"),  
+        panel.grid.major = element_line(color = "grey97"),  
+        axis.text.x = element_text(angle = 45, hjust = 1),  
+        axis.text.y = element_text(angle = 0),  
+        axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        strip.background = element_rect(fill = "grey97"),  
+        strip.text = element_text(face = "bold"), 
+        panel.border = element_rect(color = "black", fill = NA)) +
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+
+```
+<br/> <!-- Line break HTML tag -->
+
+##### The change of overall neuron spike rate for each mouse 
+
+  I then analyzed the overall neuron spike rate change for each mouse. Neural responses to the same stimuli and experimental conditions can differ among mice. I identified variations in each mouse's brain activity patterns by examining the variation in spike rates. It also helped me increase the validity of the predictive model I created after the research. Here are the charts :
+  
+  <br/> <!-- Line break HTML tag -->
+  
+```{r, echo=FALSE, fig.align='center', message=FALSE}
+
+ggplot(average_spike, aes(x = trial_id, y = mean_spike)) + 
+  geom_line(color = "black") +  
+  geom_smooth(method = "loess", color = "powderblue") +  
+  facet_wrap(~mouse_name, scales = "fixed", ncol = 2) +  
+  labs(x = "Trials", y = "Average Spike Rate") +  
+  theme(panel.background = element_rect(fill = "grey97"),  
+        strip.text = element_text(face = "bold"),  
+        panel.border = element_rect(color = "black", fill = NA))
+
+```
+The charts shows that the mean spikes across 4 mice has negative trend. Although it does not show significant difference, three charts (charts for Cori, Hench, and Lederberg) depicts that the average spike rate is in between 1 to 2, while Forssmann's regression line is in between 0 to 1. Additionally, when looking carefully at the last set of variables for all four mice chart, we can observe that it is getting narrow. 
+
+<br/> <!-- Line break HTML tag -->
+
+##### 2-4. Homeogeneity and Heterogeneity Across Sessions and Mice
+
+  I now address the differences (homeogeneity and heterogeneity) across sessions. But first, I would like to project the estimated success rate over sessions and mouse: 
+  
+<br/> <!-- Line break HTML tag -->
+
+```{r, echo=FALSE, fig.align='center', message=FALSE}
+
+success_summary <- full_functional_tibble %>% 
+  group_by(session_id) %>% 
+  summarize(success_rate = mean(success, na.rm = TRUE))
+
+
+ggplot(success_summary, aes(x = factor(session_id), y = success_rate)) +
+  geom_bar(stat = "identity", fill = "powderblue", color = "black") +  
+  labs(x = "Sessions", y = "Success Rate") +
+  ggtitle("Success Rate per Session") +
+  theme(
+    plot.title = element_text(hjust = 0.5),  
+    plot.margin = margin(50, 50, 50, 50, unit = "pt"),  
+    panel.background = element_rect(fill = "grey97")  
+  )
+```
+Although not significant difference, above bar chart shows that there is a slight trend of increasing as sessions proceed. 
+
+I observed the success rate change over time for individual sessions: 
+
+```{r,echo=FALSE}
+
+full_functional_tibble$trial_group = cut(full_functional_tibble$trial_id, breaks = seq(0, max(full_functional_tibble$trial_id), by = 25),include.lowest = TRUE)
+levels(full_functional_tibble$trial_group) <- seq(0, max(full_functional_tibble$trial_id), by = 25)[2:18]
+
+```
+
+```{r,echo=FALSE, fig.align='center'}
+
+success_rate <- aggregate(success ~ session_id + trial_group, data = full_functional_tibble, FUN = function(x) mean(x))
+ggplot(success_rate, aes(x = trial_group, y = success)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "powderblue", width = 0.9) +  
+  facet_wrap(~session_id, ncol = 3) +
+  labs(x = "trial Group", y = "Success Rate") +  
+  ggtitle("Success Rate by trial Group across Sessions") +  
+  theme_bw() +
+  theme(panel.background = element_rect(fill = "grey97"),  
+        strip.text = element_text(face = "bold"),  
+        panel.border = element_rect(color = "black", fill = NA),
+        strip.background = element_rect(fill = "grey97"),
+        axis.text.x = element_text(size = 5),
+        axis.text.y = element_text(size = 8),
+        panel.grid.major = element_line(color = "grey90"))
+```
+<br/> <!-- Line break HTML tag -->
+Here, please note that each bar includes 25 trial groups. It seems that there is no consistent trend among success rate over trial groups. Most importantly, we shoule neglect the last bar of every chart since it is not portraying total 25 trials. 
+
+<br/> <!-- Line break HTML tag -->
+
+Finally, I looked into the success rate change over time for individual mouse: 
+
+```{r,echo=FALSE, fig.align='center', message=FALSE}
+
+success_rate <- aggregate(success ~ mouse_name + trial_group, data = full_functional_tibble, FUN = function(x) mean(x))
+ggplot(success_rate, aes(x = trial_group, y = success)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "powderblue", color = "black", width = 0.9) +  
+  facet_wrap(~mouse_name, scales = "fixed", ncol = 2) +
+  theme_bw() +
+  theme(panel.background = element_rect(fill = "grey97"),
+        strip.text = element_text(face = "bold"),
+        panel.border = element_rect(color = "black", fill = NA)) +
+  labs(x = "trial Group", y = "Average Success Rate")
+
+```
+<br/> <!-- Line break HTML tag -->
+Here again, each bar denotes 25 trials. It seems that the average success rate for Cori, Hench, and Forssmann are having a positive trend in the beginning trial group and a negative trend at the last. For Lederberg, it is projecting an irregular trend. 
+<br/> <!-- Line break HTML tag -->
+
+### | 3. Data Integration |
+
+According to the findings from the data structure, I combined the data across trials by extracting the shared patterns across sessions and addressing the differences between sessions. The goal here was to enable the borrowing of information across sessions to enhance the prediction performance.
+The table illustrates the names of mice, experiment date, and number of brain areas, neurons, trials, and success rate for each session. Each line indicates one session, so a total of 18 sessions is shown:  
+
+<br/> <!-- Line break HTML tag -->
+
+```{r, echo=FALSE, fig.align='center', message=FALSE}
+
+n.session <- length(session)
+
+mice18 <- tibble(
+  Names_of_mouse = rep('name', n.session),  
+  Experiment_date = rep('dt', n.session),           
+  Number_of_brain_area = rep(0, n.session),     
+  Number_of_neurons = rep(0, n.session),       
+  Number_of_trials = rep(0, n.session),         
+  Success_rate = rep(0, n.session)  
+)
+
+colnames(mice18) <- str_replace_all(colnames(mice18), "_", " ")
+
+for(i in 1:18) {
+  tmp <- session[[i]]
+  mice18[i, 1] <- tmp$mouse_name
+  mice18[i, 2] <- tmp$date_exp
+  mice18[i, 3] <- length(unique(tmp$brain_area))
+  mice18[i, 4] <- dim(tmp$spks[[1]])[1]
+  mice18[i, 5] <- length(tmp$feedback_type)
+  mice18[i, 6] <- mean(tmp$feedback_type + 1) / 2
+}
+
+kable(mice18, format = "html", table.attr = "class='table table-striped' style='text-align: center; border-collapse: collapse;'", digits = 2, 
+      caption = "<div style='text-align: center;'>Summary of Mice Data</div>") %>% 
+  add_footnote("Note:") %>%
+  kable_styling(full_width = FALSE, 
+                bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+
+<br/> <!-- Line break HTML tag -->
+
+### | 4. Predictive Modeling |
+
+The objective of Predictive Modeling section is to build a prediction model to predict outcomes. I aim to find a model that projects high accuracy. In this section, I trained the predictive model on 80% trails and tested on the rest. 
+
+```{r,echo=FALSE,include=FALSE}
+
+predictive_feature <- c("session_id","trial_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+
+
+```
+
+```{r,echo=FALSE}
+
+predictive_dat <- full_functional_tibble[predictive_feature]
+predictive_dat$trial_id <- as.numeric(predictive_dat$trial_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_dat)
+
+```
+<br/> <!-- Line break HTML tag -->
+
+##### 4-1. train the model on 80% trials and test it on the rest 
+
+```{r,echo=FALSE}
+
+
+set.seed(123)
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+
+```{r,echo=FALSE, include=FALSE}
+
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+```
+
+The following chart shows the success rate over 10 tries: 
+
+```{r, echo=FALSE}
+
+train_logloss <- c(0.601631, 0.550638, 0.510053, 0.481637, 0.460702, 
+                   0.441478, 0.426525, 0.414870, 0.408038, 0.392890)
+
+iterations <- seq_along(train_logloss)
+
+plot(iterations, train_logloss, type = "b", col = "powderblue",
+     xlab = "Iterations", ylab = "Training Log Loss",
+     main = "Success Rate over Iterations", 
+     bg = "grey97", pch = 16, bty = "n", 
+     xlim = c(0, max(iterations)), ylim = c(0, max(train_logloss)))
+
+axis(1, at = 0)
+
+axis(2, at = seq(0, max(train_logloss), by = 0.2))
+
+
+```
+<br/> <!-- Line break HTML tag -->
+
+The plot shows a decreasing trend over the iterations of success rate. The success rate starts with 0.601631, goes to 0.460702, and finalize with 0.392890. 
+And here are the prediction results (please not that 0 means negative class, and 1 means positive class).
+
+<br/> <!-- Line break HTML tag -->
+
+\[
+\begin{array}{ccc}
+\text{Reference} & 0 & 1 \\
+\text{Prediction} & & \\
+0 & 76 & 52 \\
+1 & 221 & 667 \\
+\end{array}
+\]
+
+<br/> <!-- Line break HTML tag -->
+
+1. The model made 76 correct predictions of 0 when the true label was also negative.
+2. The model made 667 correct predictions of 1 when the true label was also positive.
+3. The model made 52 incorrect predictions of 1  when the true label was negative.
+4. The model made 221 incorrect predictions of 0 when the true label was positive.
+
+<br/> <!-- Line break HTML tag -->
+
+### | 5. Prediction Performace on the Test Sets |
+<br/> <!-- Line break HTML tag -->
+At last, I tried to test my predictive model using the test data given in class. By testing my predictive model, I could get an accuracy of my model. 
+
+```{r,echo=FALSE, include=FALSE}
+
+test=list()
+for(i in 1:2){
+  test[[i]]=readRDS(paste('./test/test',i,'.rds',sep=''))
+    print(test[[i]]$mouse_name)
+    print(test[[i]]$date_exp)
+}
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+get_trial_data2 <- function(test_id, trial_id){
+  spikes <- test[[test_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = test[[test_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trial_tibble  = trial_tibble%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= test[[test_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= test[[test_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= test[[test_id]]$feedback_type[trial_id])
+  trial_tibble
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+get_test_data <- function(test_id){
+  n_trial <- length(test[[test_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_data2(test_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  test_tibble <- do.call(rbind, trial_list)
+  test_tibble <- test_tibble %>% add_column("mouse_name" = test[[test_id]]$mouse_name) %>% add_column("date_exp" = test[[test_id]]$date_exp) %>% add_column("test_id" = test_id) 
+  test_tibble
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+binename <- paste0("bin", as.character(1:40))
+
+get_trial_functional_data2 <- function(test_id, trial_id){
+  spikes <- test[[test_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trial_bin_average) <- binename
+  trial_tibble  = as_tibble(trial_bin_average)%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= test[[test_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= test[[test_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= test[[test_id]]$feedback_type[trial_id])
+  
+  trial_tibble
+}
+get_test_functional_data <- function(test_id){
+  n_trial <- length(test[[test_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_functional_data2(test_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  test_tibble <- as_tibble(do.call(rbind, trial_list))
+  test_tibble <- test_tibble %>% add_column("mouse_name" = test[[test_id]]$mouse_name) %>% add_column("date_exp" = test[[test_id]]$date_exp) %>% add_column("test_id" = test_id) 
+  test_tibble
+}
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+test_list = list()
+for (test_id in 1: 2){
+  test_list[[test_id]] <- get_test_functional_data(test_id)
+}
+full_functional_tibble2 <- as_tibble(do.call(rbind, test_list))
+full_functional_tibble2$test_id <- as.factor(full_functional_tibble2$test_id )
+full_functional_tibble2$contrast_diff <- abs(full_functional_tibble2$contrast_left-full_functional_tibble2$contrast_right)
+
+full_functional_tibble2$success <- full_functional_tibble2$feedback_type == 1
+full_functional_tibble2$success <- as.numeric(full_functional_tibble2$success)
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+test_list = list()
+for (test_id in 1: 2){
+  test_list[[test_id]] <- get_test_data(test_id)
+}
+full_tibble2 <- do.call(rbind, test_list)
+full_tibble2$success <- full_tibble2$feedback_type == 1
+full_tibble2$success <- as.numeric(full_tibble2$success)
+full_tibble2$contrast_diff <- abs(full_tibble2$contrast_left-full_tibble2$contrast_right)
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+show_contrast <- full_functional_tibble2 %>% group_by(contrast_diff) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+test_success_rate <- full_functional_tibble2 %>% group_by(test_id) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+
+```
+
+```{r,echo=FALSE,include=FALSE}
+predictive_feature2 <- c("test_id","trial_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+head(full_functional_tibble2[predictive_feature2])
+```
+
+```{r,echo=FALSE}
+
+predictive_dat2 <- full_functional_tibble2[predictive_feature2]
+
+predictive_dat2$trial_id <- as.numeric(predictive_dat2$trial_id)
+label <- as.numeric(full_functional_tibble2$success)
+X <- model.matrix(~., predictive_dat2)
+
+```
+
+```{r,echo=FALSE}
+
+set.seed(123)
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_dat2[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat2[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+```
+
+
+```{r,echo=FALSE, include=FALSE}
+
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+
+```
+
+```{r,echo=FALSE, include=FALSE}
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+
+```
+
+```{r,echo=FALSE, message=FALSE}
+
+auroc <- roc(test_label, predictions)
+auroc
+
+```
+By testing, I got 0.4747 accuracy of the predictive model. 
+
+<br/> <!-- Line break HTML tag -->
+
+### | 6. Conclusion |
+
+In the pursuit of improving the predictive accuracy of the model, several analysis of data and models were undertaken. Initially, the data set was processed to select relevant predictive features. The data was then split into training and testing sets, with 80% allocated for training and the remainder for testing. To build the prediction model, an xgboost package was operated, a decision that originated from considerations on function performance binary classification tasks. Then, the model was trained on the training data. Once trained, the model was utilized to make predictions on the testing set. The resulting predictions were then evaluated for accuracy, yielding a value of 0.4747 for the area under the ROC curve (AUC). This metric, as referenced in earlier above, serves as a measure of the model's ability, distinguishing between the two variables-success and failure. The obtained AUC value of 0.4747 suggests that the model's performance is only marginally better than random chance.
+ 
+### | 7. Reference  |
+
+This report reference the following sites: 
+
+https://plotly.com/r/
+https://chat.openai.com/
+
+
+* For *https://chat.openai.com/* I had the AI assist with functions of 'knitr', 'kableExtra', 'tibble', 'ggplot2', 'xgboost', and 'caret' package (i.e. designing plots, charts, tables)
+
+
